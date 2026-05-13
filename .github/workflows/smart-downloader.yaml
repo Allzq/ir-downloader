@@ -1,10 +1,10 @@
-name: '📦 دانلود و ذخیره در مخزن'
+name: '📦 دانلود و ذخیره در مخزن (پشتیبانی از Steam Workshop)'
 
 on:
   workflow_dispatch:
     inputs:
       file_urls:
-        description: '🔗 لینک مستقیم فایل‌ها (با کاما جدا کنید) مثال: url1,url2,url3'
+        description: '🔗 لینک فایل‌ها (با کاما جدا کنید) مثال: url1,url2,url3'
         required: true
         type: string
       custom_names:
@@ -30,7 +30,8 @@ jobs:
       - name: ⚙️ نصب ابزارها
         run: |
           sudo apt-get update
-          sudo apt-get install -y p7zip-full file aria2 curl
+          sudo apt-get install -y p7zip-full file aria2 curl python3 python3-pip
+          pip3 install requests --break-system-packages || pip3 install requests
 
       - name: 🔧 تنظیم بافر HTTP
         run: |
@@ -38,7 +39,7 @@ jobs:
           git config --global http.lowSpeedLimit 0
           git config --global http.lowSpeedTime 999999
 
-      - name: 📥 پردازش و دانلود فایل‌ها
+      - name: 📥 پردازش و دانلود فایل‌ها (با پشتیبانی از Steam Workshop)
         run: |
           set +v
           # آماده‌سازی لیست لینک‌ها
@@ -55,6 +56,62 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # ---------- اسکریپت کمکی برای Steam Workshop ----------
+          cat > /tmp/steam_download.py << 'PYEOF'
+          import sys, re, requests, os
+
+          def download_steam_workshop(url, output_path):
+              # استخراج id از لینک‌های مختلف
+              match = re.search(r'[?&]id=(\d+)', url)
+              if not match:
+                  print(f"❌ شناسه آیتم در لینک یافت نشد: {url}")
+                  return False
+              item_id = match.group(1)
+
+              # فراخوانی API عمومی استیم (بدون نیاز به کلید)
+              api_url = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
+              payload = {"itemcount": 1, f"publishedfileids[0]": item_id}
+              try:
+                  resp = requests.post(api_url, data=payload, timeout=30)
+                  resp.raise_for_status()
+                  data = resp.json()
+                  details = data.get("response", {}).get("publishedfiledetails", [])
+                  if not details:
+                      print(f"❌ جزئیاتی برای آیتم {item_id} یافت نشد")
+                      return False
+                  file_url = details[0].get("file_url")
+                  filename = details[0].get("filename")
+                  if not file_url:
+                      print(f"❌ لینک دانلود برای آیتم {item_id} موجود نیست")
+                      return False
+                  if not filename:
+                      filename = f"workshop_{item_id}.bin"
+
+                  print(f"✅ دریافت لینک دانلود: {file_url}")
+                  print(f"📄 نام فایل اصلی: {filename}")
+
+                  # دانلود فایل نهایی
+                  r = requests.get(file_url, stream=True)
+                  r.raise_for_status()
+                  with open(output_path, "wb") as f:
+                      for chunk in r.iter_content(chunk_size=8192):
+                          if chunk:
+                              f.write(chunk)
+                  print(f"💾 فایل ذخیره شد: {output_path}")
+                  return True
+              except Exception as e:
+                  print(f"❌ خطا در ارتباط با API استیم: {e}")
+                  return False
+
+          if __name__ == "__main__":
+              if len(sys.argv) != 3:
+                  sys.exit(1)
+              url = sys.argv[1]
+              out = sys.argv[2]
+              success = download_steam_workshop(url, out)
+              sys.exit(0 if success else 1)
+          PYEOF
+
           COUNTER=0
           while IFS= read -r URL; do
             [ -z "$URL" ] && continue
@@ -64,56 +121,77 @@ jobs:
             echo "🔽 [${COUNTER}/${TOTAL_URLS}] شروع پردازش: $URL"
             echo "============================================================"
 
-            # ----- مرحله ۱: استخراج نام فایل (اولویت با نام دلخواه) -----
-            echo "🔍 [1/4] شناسایی نام فایل..."
+            # ----- مرحله ۱: تعیین نام فایل نهایی (اولویت با نام دلخواه) -----
+            echo "🔍 [1/5] شناسایی نام فایل..."
             if [ -n "${NAME_ARRAY[$((COUNTER-1))]}" ]; then
-              REAL_FILENAME="${NAME_ARRAY[$((COUNTER-1))]}"
-              echo "   🏷️ استفاده از نام دلخواه: $REAL_FILENAME"
+              BASE_NAME="${NAME_ARRAY[$((COUNTER-1))]}"
+              echo "   🏷️ استفاده از نام دلخواه: $BASE_NAME"
             else
-              REAL_FILENAME=$(curl -sI "$URL" | grep -i 'Content-Disposition' | sed -n 's/.*filename="\([^"]*\)".*/\1/p')
-              if [ -z "$REAL_FILENAME" ]; then
-                REAL_FILENAME=$(echo "$URL" | grep -oP '(?<=filename=)[^&]+' | sed 's/%20/ /g' 2>/dev/null || true)
-              fi
-              if [ -z "$REAL_FILENAME" ]; then
-                REAL_FILENAME=$(basename "$URL" | sed 's/\?.*//' | sed 's/%20/ /g')
-              fi
-              if [ -z "$REAL_FILENAME" ]; then
-                REAL_FILENAME="file_$(date +%s)"
-              fi
-            fi
-            SAFE_FILENAME=$(echo "$REAL_FILENAME" | sed 's/[\\/:*?"<>|]/_/g')
-            echo "   📛 نام پایه: $SAFE_FILENAME"
-
-            # ----- مرحله ۲: دانلود با تلاش مجدد (تا ۱۰ بار) -----
-            echo "⏳ [2/4] دانلود فایل (با قابلیت ادامه و تلاش مجدد)..."
-            MAX_RETRIES=10
-            RETRY=0
-            SUCCESS=false
-            while [ $RETRY -lt $MAX_RETRIES ] && [ "$SUCCESS" = false ]; do
-              if [ $RETRY -gt 0 ]; then
-                echo "   ⚠️ تلاش مجدد $RETRY/$MAX_RETRIES (بعد از ۱۰ ثانیه)..."
-                sleep 10
-              fi
-              aria2c --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-                     --max-connection-per-server=4 --split=4 --min-split-size=1M \
-                     --continue=true --retry-wait=10 --max-tries=1 --timeout=60 \
-                     --console-log-level=error -o "$SAFE_FILENAME" "$URL" > /tmp/aria2.log 2>&1
-              if [ $? -eq 0 ]; then
-                SUCCESS=true
-                echo "   ✅ دانلود کامل شد."
+              # اگر لینک Steam باشد، نام را بعداً از API می‌گیریم (فعلاً موقت)
+              if echo "$URL" | grep -q "steamcommunity\.com.*filedetails"; then
+                BASE_NAME="temp_steam_${COUNTER}"
+                echo "   🎮 لینک Steam Workshop - نام موقت: $BASE_NAME"
               else
-                RETRY=$((RETRY+1))
+                BASE_NAME=$(curl -sI "$URL" | grep -i 'Content-Disposition' | sed -n 's/.*filename="\([^"]*\)".*/\1/p')
+                if [ -z "$BASE_NAME" ]; then
+                  BASE_NAME=$(echo "$URL" | grep -oP '(?<=filename=)[^&]+' | sed 's/%20/ /g' 2>/dev/null || true)
+                fi
+                if [ -z "$BASE_NAME" ]; then
+                  BASE_NAME=$(basename "$URL" | sed 's/\?.*//' | sed 's/%20/ /g')
+                fi
+                if [ -z "$BASE_NAME" ]; then
+                  BASE_NAME="file_$(date +%s)"
+                fi
               fi
-            done
+            fi
+            SAFE_BASE=$(echo "$BASE_NAME" | sed 's/[\\/:*?"<>|]/_/g')
+            echo "   📛 نام پایه: $SAFE_BASE"
 
-            if [ "$SUCCESS" = false ]; then
-              echo "❌ خطا: دانلود فایل $SAFE_FILENAME پس از $MAX_RETRIES تلاش ناموفق بود. رد کردن این لینک..."
-              continue
+            # ----- مرحله ۲: دانلود فایل (با متد مناسب) -----
+            echo "⏳ [2/5] دانلود فایل..."
+            TEMP_FILE="downloaded_${COUNTER}.tmp"
+            rm -f "$TEMP_FILE"
+
+            if echo "$URL" | grep -q "steamcommunity\.com.*filedetails"; then
+              echo "🎮 شناسایی لینک Steam Workshop - استفاده از اسکریپت اختصاصی"
+              if python3 /tmp/steam_download.py "$URL" "$TEMP_FILE"; then
+                echo "✅ دانلود از Steam با موفقیت انجام شد."
+                # سعی کنیم نام واقعی فایل را از هدر یا پاسخ API بگیریم (قبلاً در اسکریپت چاپ شده)
+                # ولی برای اطمینان، نام را همان SAFE_BASE می‌گذاریم (بدون پسوند)
+              else
+                echo "❌ خطا در دانلود از Steam Workshop. رد کردن این لینک..."
+                continue
+              fi
+            else
+              # دانلود معمولی با aria2c (با تلاش مجدد)
+              MAX_RETRIES=10
+              RETRY=0
+              SUCCESS=false
+              while [ $RETRY -lt $_MAX_RETRIES ] && [ "$SUCCESS" = false ]; do
+                if [ $RETRY -gt 0 ]; then
+                  echo "   ⚠️ تلاش مجدد $RETRY/$MAX_RETRIES (بعد از ۱۰ ثانیه)..."
+                  sleep 10
+                fi
+                aria2c --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+                       --max-connection-per-server=4 --split=4 --min-split-size=1M \
+                       --continue=true --retry-wait=10 --max-tries=1 --timeout=60 \
+                       --console-log-level=error -o "$TEMP_FILE" "$URL" > /tmp/aria2.log 2>&1
+                if [ $? -eq 0 ]; then
+                  SUCCESS=true
+                  echo "   ✅ دانلود کامل شد."
+                else
+                  RETRY=$((RETRY+1))
+                fi
+              done
+              if [ "$SUCCESS" = false ]; then
+                echo "❌ خطا: دانلود فایل پس از $MAX_RETRIES تلاش ناموفق بود. رد کردن این لینک..."
+                continue
+              fi
             fi
 
-            # ----- مرحله ۳: تشخیص فرمت واقعی و اضافه کردن پسوند -----
-            echo "🔍 [3/4] تشخیص فرمت فایل و اصلاح پسوند..."
-            REAL_MIME=$(file -b --mime-type "$SAFE_FILENAME")
+            # ----- مرحله ۳: تشخیص فرمت واقعی و اصلاح پسوند (برای فایل نهایی) -----
+            echo "🔍 [3/5] تشخیص فرمت فایل و اصلاح پسوند..."
+            REAL_MIME=$(file -b --mime-type "$TEMP_FILE")
             EXT=""
             case "$REAL_MIME" in
               video/mp4) EXT="mp4" ;; video/webm) EXT="webm" ;;
@@ -125,27 +203,26 @@ jobs:
               application/vnd.android.package-archive) EXT="apk" ;;
             esac
             if [ -n "$EXT" ]; then
-              BASENAME_NOEXT="${SAFE_FILENAME%.*}"
-              NEW_NAME="${BASENAME_NOEXT}.$EXT"
-              if [ "$NEW_NAME" != "$SAFE_FILENAME" ]; then
-                mv "$SAFE_FILENAME" "$NEW_NAME"
-                SAFE_FILENAME="$NEW_NAME"
-                echo "   ✅ پسوند اضافه شد: $SAFE_FILENAME"
-              else
-                echo "   ✅ پسوند درست است."
+              FINAL_FILENAME="${SAFE_BASE}.${EXT}"
+              if [ "$FINAL_FILENAME" != "$SAFE_BASE" ]; then
+                mv "$TEMP_FILE" "$FINAL_FILENAME"
+                TEMP_FILE="$FINAL_FILENAME"
+                echo "   ✅ پسوند اضافه شد: $FINAL_FILENAME"
               fi
             else
+              FINAL_FILENAME="$SAFE_BASE"
+              mv "$TEMP_FILE" "$FINAL_FILENAME"
+              TEMP_FILE="$FINAL_FILENAME"
               echo "   ⚠️ فرمت ناشناخته، بدون تغییر باقی ماند."
             fi
 
-            # ----- مرحله ۴: دسته‌بندی و فشرده‌سازی (mx=7, md=64m) -----
-            echo "📁 [4/4] دسته‌بندی و ایجاد آرشیو (قطعات 90 مگابایت)..."
-            BASENAME_NOEXT="${SAFE_FILENAME%.*}"
+            # ----- مرحله ۴: دسته‌بندی و فشرده‌سازی (نام آرشیو = نام فایل) -----
+            echo "📁 [4/5] دسته‌بندی و ایجاد آرشیو (قطعات 90 مگابایت)..."
+            BASENAME_NOEXT="${FINAL_FILENAME%.*}"
             FOLDER_NAME=$(echo "$BASENAME_NOEXT" | sed 's/[\\/:*?"<>|]/_/g')
             [ -z "$FOLDER_NAME" ] && FOLDER_NAME="downloaded_file"
 
-            MIME=$(file -b --mime-type "$SAFE_FILENAME")
-            EXT="${SAFE_FILENAME##*.}"
+            MIME=$(file -b --mime-type "$FINAL_FILENAME")
             if [[ "$MIME" == video/* ]]; then CAT="video"
             elif [[ "$MIME" == audio/* ]]; then CAT="audio"
             elif [[ "$MIME" == image/* ]]; then CAT="image"
@@ -157,16 +234,17 @@ jobs:
             mkdir -p "$FINAL_DIR"
             rm -f "$FINAL_DIR"/*.7z*
 
+            ARCHIVE_NAME="${BASENAME_NOEXT}.7z"   # نام آرشیو برابر با نام فایل اصلی
             if [ -z "${{ github.event.inputs.password }}" ]; then
-              7z a -mhe=on -mx=7 -md=128m -v90m "$FINAL_DIR/archive.7z" "./$SAFE_FILENAME" > /dev/null
+              7z a -mhe=on -mx=7 -md=128m -v90m "$FINAL_DIR/$ARCHIVE_NAME" "./$FINAL_FILENAME" > /dev/null
             else
-              7z a -p"${{ github.event.inputs.password }}" -mhe=on -mx=7 -md=64m -v90m "$FINAL_DIR/archive.7z" "./$SAFE_FILENAME" > /dev/null
+              7z a -p"${{ github.event.inputs.password }}" -mhe=on -mx=7 -md=64m -v90m "$FINAL_DIR/$ARCHIVE_NAME" "./$FINAL_FILENAME" > /dev/null
             fi
-            rm -f "$SAFE_FILENAME"
-            echo "   ✅ آرشیو در $FINAL_DIR ساخته شد."
+            rm -f "$FINAL_FILENAME"
+            echo "   ✅ آرشیو در $FINAL_DIR/$ARCHIVE_NAME ساخته شد."
 
-            # ----- push تدریجی (هر فایل جداگانه) -----
-            echo "📤 ارسال به مخزن (push تدریجی)..."
+            # ----- مرحله ۵: ارسال تدریجی به مخزن -----
+            echo "📤 [5/5] ارسال به مخزن (push تدریجی)..."
             git add "$FINAL_DIR/"
             git commit -m "Add $FOLDER_NAME [$(date +'%H:%M:%S')]" || echo "   ⚠️ بدون تغییر جدید"
             git push --force-with-lease origin HEAD:${GITHUB_REF#refs/heads/} 2>&1 | grep -E "(error|fatal|Done|Everything up-to-date)" || true
